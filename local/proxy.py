@@ -45,44 +45,45 @@
 #      Hubertzhang       <hubert.zyk@gmail.com>
 #      arrix             <arrixzhou@gmail.com>
 
-__version__ = '3.1.20'
+__version__ = '3.1.22'
 
-import sys
 import os
+import sys
 import sysconfig
 
 reload(sys).setdefaultencoding('UTF-8')
 sys.dont_write_bytecode = True
-sys.path += [os.path.abspath(os.path.join(__file__, '../packages.egg/%s' % x)) for x in ('noarch', sysconfig.get_platform().split('-')[0])]
+sys.path = [(os.path.dirname(__file__) or '.') + '/packages.egg/noarch'] + sys.path + [(os.path.dirname(__file__) or '.') + '/packages.egg/' + sysconfig.get_platform().split('-')[0]]
 
-import gevent
-import gevent.socket
-import gevent.server
-import gevent.queue
-import gevent.monkey
-gevent.monkey.patch_all(subprocess=True)
+try:
+    __import__('gevent.monkey', fromlist=['.']).patch_all()
+except (ImportError, SystemError):
+    sys.exit(sys.stderr.write('please install python-gevent\n'))
 
-import errno
-import time
-import struct
-import collections
-import zlib
-import httplib
-import re
-import io
-import traceback
-import random
 import base64
-import uuid
-import urlparse
-import threading
-import thread
+import collections
+import ConfigParser
+import errno
+import httplib
+import io
+import Queue
+import random
+import re
 import socket
 import ssl
-import Queue
-import ConfigParser
+import struct
+import thread
+import threading
+import time
+import traceback
 import urllib2
+import urlparse
+import zlib
 
+import gevent
+import gevent.queue
+import gevent.server
+import gevent.socket
 import OpenSSL
 
 NetWorkIOError = (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
@@ -185,7 +186,6 @@ from proxylib import get_dnsserver_list
 from proxylib import get_process_list
 from proxylib import get_uptime
 from proxylib import inflate
-from proxylib import JumpLastFilter
 from proxylib import LocalProxyServer
 from proxylib import message_html
 from proxylib import MockFetchPlugin
@@ -383,12 +383,13 @@ class GAEFetchPlugin(BaseFetchPlugin):
     connect_timeout = 4
     max_retry = 2
 
-    def __init__(self, appids, password, path, mode, keepalive, obfuscate, pagespeed, validate, options):
+    def __init__(self, appids, password, path, mode, cachesock, keepalive, obfuscate, pagespeed, validate, options):
         BaseFetchPlugin.__init__(self)
         self.appids = appids
         self.password = password
         self.path = path
         self.mode = mode
+        self.cachesock = cachesock
         self.keepalive = keepalive
         self.obfuscate = obfuscate
         self.pagespeed = pagespeed
@@ -485,6 +486,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
             kwargs['options'] = self.options
         if self.validate:
             kwargs['validate'] = self.validate
+        kwargs['fetchmaxsize'] = common.AUTORANGE_MAXSIZE
         metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
         skip_headers = handler.skip_headers
         metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
@@ -494,7 +496,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
         request_headers = {}
         if common.GAE_OBFUSCATE:
             request_method = 'GET'
-            fetchserver += '/ps/%s.gif' % uuid.uuid1()
+            fetchserver += '/ps/%d%s.gif' % (int(time.time()*1000), random.random())
             request_headers['X-GOA-PS1'] = base64.b64encode(deflate(metadata)).strip()
             if body:
                 request_headers['X-GOA-PS2'] = base64.b64encode(deflate(body)).strip()
@@ -512,11 +514,10 @@ class GAEFetchPlugin(BaseFetchPlugin):
         need_crlf = 0 if common.GAE_MODE == 'https' else 1
         need_validate = common.GAE_VALIDATE
         cache_key = '%s:%d' % (common.HOST_POSTFIX_MAP['.appspot.com'], 443 if common.GAE_MODE == 'https' else 80)
-        cache_key = ''
         response = handler.create_http_request(request_method, fetchserver, request_headers, body, timeout, crlf=need_crlf, validate=need_validate, cache_key=cache_key)
         response.app_status = response.status
         response.app_options = response.getheader('X-GOA-Options', '')
-        if response.status != 200:
+        if response.status != 200 or int(response.msg.get('status', 200)) >= 400:
             return response
         data = response.read(4)
         if len(data) < 4:
@@ -562,6 +563,10 @@ class PHPFetchPlugin(BaseFetchPlugin):
                     headers['Content-Encoding'] = 'deflate'
             headers['Content-Length'] = str(len(body))
         skip_headers = handler.skip_headers
+        if self.password:
+            kwargs['password'] = self.password
+        if self.validate:
+            kwargs['validate'] = self.validate
         metadata = 'G-Method:%s\nG-Url:%s\n%s%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v), ''.join('%s:%s\n' % (k, v) for k, v in headers.items() if k not in skip_headers))
         metadata = deflate(metadata)
         app_body = b''.join((struct.pack('!h', len(metadata)), metadata, body))
@@ -577,19 +582,51 @@ class PHPFetchPlugin(BaseFetchPlugin):
         if need_decrypt:
             response.fp = CipherFileObject(response.fp, XORCipher(self.password[0]))
         logging.info('%s "PHP %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
-        need_chunked = response.getheader('Transfer-Encoding')
+        handler.close_connection = bool(response.getheader('Transfer-Encoding'))
         while True:
             data = response.read(8192)
             if not data:
-                if need_chunked:
-                    handler.wfile.write('0\r\n\r\n')
                 break
-            if need_chunked:
-                handler.wfile.write('%x\r\n' % len(data))
             handler.wfile.write(data)
-            if need_chunked:
-                handler.wfile.write('\r\n')
             del data
+
+
+class VPSFetchPlugin(BaseFetchPlugin):
+    """vps fetch plugin"""
+    connect_timeout = 4
+
+    def __init__(self, fetchservers, username, password):
+        BaseFetchPlugin.__init__(self)
+        self.fetchservers = fetchservers
+        self.username = username
+        self.password = password
+        self.fake_headers = {}
+
+    def handle(self, handler, **kwargs):
+        if handler.command == 'CONNECT':
+            return self.handle_connect(handler, **kwargs)
+        else:
+            return self.handle_method(handler, **kwargs)
+
+    def handle_connect(self, handler, **kwargs):
+        return
+
+    def handle_method(self, handler, **kwargs):
+        method = handler.command
+        url = handler.path
+        headers = dict((k.title(), v) for k, v in handler.headers.items() if k.title() not in handler.skip_headers)
+        x_headers = {}
+        if 'Host' in headers:
+            x_headers['Host'] = headers.pop('Host')
+        if 'Cookie' in headers:
+            x_headers['Cookie'] = headers.pop('Cookie')
+        headers['Host'] = 'www.%s.com' % self.username
+        self.fake_headers = headers.copy()
+        fetchserver = random.choice(self.fetchservers)
+        response = handler.create_http_request(handler.command, fetchserver, headers, handler.body, self.connect_timeout)
+        if not response:
+            raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
+        #TODO
 
 
 class HostsFilter(BaseProxyHandlerFilter):
@@ -612,7 +649,7 @@ class HostsFilter(BaseProxyHandlerFilter):
         elif hostname.endswith(self.host_postfix_endswith):
             hosts = next(self.host_postfix_map[x] for x in self.host_postfix_map if hostname.endswith(x))
         if hostport in self.hostport_map:
-            hosts = self.host_map[hostname]
+            hosts = self.hostport_map[hostport]
         elif hostport.endswith(self.hostport_postfix_endswith):
             hosts = next(self.hostport_postfix_map[x] for x in self.hostport_postfix_map if hostport.endswith(x))
         if handler.command != 'CONNECT' and self.urlre_map:
@@ -627,8 +664,16 @@ class HostsFilter(BaseProxyHandlerFilter):
     def filter(self, handler):
         host, port = handler.host, handler.port
         hostport = handler.path if handler.command == 'CONNECT' else '%s:%d' % (host, port)
-        if host in self.host_map or host.endswith(self.host_postfix_endswith) or hostport in self.hostport_map or hostport.endswith(self.hostport_postfix_endswith):
-            return 'direct', {}
+        if host in self.host_map:
+            return 'direct', {'cache_key': '%s:%d' % (self.host_map[host], port)}
+        elif host.endswith(self.host_postfix_endswith):
+            self.host_map[host] = next(self.host_postfix_map[x] for x in self.host_postfix_map if host.endswith(x))
+            return 'direct', {'cache_key': '%s:%d' % (self.host_map[host], port)}
+        elif hostport in self.hostport_map:
+            return 'direct', {'cache_key': '%s:%d' % (self.hostport_map[hostport], port)}
+        elif hostport.endswith(self.hostport_postfix_endswith):
+            self.hostport_map[hostport] = next(self.hostport_postfix_map[x] for x in self.hostport_postfix_map if hostport.endswith(x))
+            return 'direct', {'cache_key': '%s:%d' % (self.hostport_map[hostport], port)}
         if handler.command != 'CONNECT' and self.urlre_map and any(x(handler.path) for x in self.urlre_map):
             return 'direct', {}
 
@@ -650,6 +695,32 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
                 return 'direct', {}
 
 
+class WithGAEFilter(BaseProxyHandlerFilter):
+    """force https filter"""
+    def __init__(self, withgae_sites, withphp_sites, withvps_sites):
+        self.withgae_sites = set(x for x in withgae_sites if not x.startswith('.'))
+        self.withgae_sites_postfix = tuple(x for x in withgae_sites if x.startswith('.'))
+        self.withphp_sites = set(x for x in withphp_sites if not x.startswith('.'))
+        self.withphp_sites_postfix = tuple(x for x in withphp_sites if x.startswith('.'))
+        self.withvps_sites = set(x for x in withvps_sites if not x.startswith('.'))
+        self.withvps_sites_postfix = tuple(x for x in withvps_sites if x.startswith('.'))
+
+    def filter(self, handler):
+        plugin = ''
+        if handler.host in self.withgae_sites or handler.host.endswith(self.withgae_sites_postfix):
+            plugin = 'gae'
+        elif handler.host in self.withphp_sites or handler.host.endswith(self.withphp_sites_postfix):
+            plugin = 'php'
+        elif handler.host in self.withvps_sites or handler.host.endswith(self.withvps_sites_postfix):
+            plugin = 'vps'
+        if plugin:
+            if handler.command == 'CONNECT':
+                do_ssl_handshake = 440 <= handler.port <= 450 or 1024 <= handler.port <= 65535
+                return 'strip', {'do_ssl_handshake': do_ssl_handshake}
+            else:
+                return plugin, {}
+
+
 class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
     """GAE Proxy Handler"""
     handler_filters = [GAEFetchFilter()]
@@ -667,7 +738,7 @@ class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
         random.shuffle(common.GAE_APPIDS)
-        self.__class__.handler_plugins['gae'] = GAEFetchPlugin(common.GAE_APPIDS, common.GAE_PASSWORD, common.GAE_PATH, common.GAE_MODE, common.GAE_KEEPALIVE, common.GAE_OBFUSCATE, common.GAE_PAGESPEED, common.GAE_VALIDATE, common.GAE_OPTIONS)
+        self.__class__.handler_plugins['gae'] = GAEFetchPlugin(common.GAE_APPIDS, common.GAE_PASSWORD, common.GAE_PATH, common.GAE_MODE, common.GAE_CACHESOCK, common.GAE_KEEPALIVE, common.GAE_OBFUSCATE, common.GAE_PAGESPEED, common.GAE_VALIDATE, common.GAE_OPTIONS)
         try:
             self.__class__.hosts_filter = next(x for x in self.__class__.handler_filters if isinstance(x, HostsFilter))
         except StopIteration:
@@ -710,9 +781,6 @@ class PHPProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
 
     def __init__(self, *args, **kwargs):
         SimpleProxyHandler.__init__(self, *args, **kwargs)
-
-    def first_run(self):
-        self.__class__.handler_plugins['php'] = PHPFetchPlugin(common.PHP_FETCHSERVERS, common.PHP_PASSWORD, common.PHP_VALIDATE)
 
 
 class ProxyPHPProxyHandler(ProxyConnectionMixin, PHPProxyHandler):
@@ -1126,7 +1194,8 @@ class Common(object):
         self.GAE_MODE = self.CONFIG.get('gae', 'mode')
         self.GAE_PROFILE = self.CONFIG.get('gae', 'profile').strip()
         self.GAE_WINDOW = self.CONFIG.getint('gae', 'window')
-        self.GAE_KEEPALIVE = self.CONFIG.getint('gae', 'keepalive') if self.CONFIG.has_option('gae', 'keepalive') else 0
+        self.GAE_KEEPALIVE = self.CONFIG.getint('gae', 'keepalive')
+        self.GAE_CACHESOCK = self.CONFIG.getint('gae', 'cachesock')
         self.GAE_OBFUSCATE = self.CONFIG.getint('gae', 'obfuscate')
         self.GAE_VALIDATE = self.CONFIG.getint('gae', 'validate')
         self.GAE_TRANSPORT = self.CONFIG.getint('gae', 'transport') if self.CONFIG.has_option('gae', 'transport') else 0
@@ -1154,6 +1223,8 @@ class Common(object):
         hostport_postfix_map = collections.OrderedDict()
         urlre_map = collections.OrderedDict()
         withgae_sites = []
+        withphp_sites = []
+        withvps_sites = []
         crlf_sites = []
         nocrlf_sites = []
         forcehttps_sites = []
@@ -1171,6 +1242,8 @@ class Common(object):
                 urlrewrite_map[site] = rule
                 continue
             for name, sites in [('withgae', withgae_sites),
+                                ('withphp', withphp_sites),
+                                ('withvps', withvps_sites),
                                 ('crlf', crlf_sites),
                                 ('nocrlf', nocrlf_sites),
                                 ('forcehttps', forcehttps_sites),
@@ -1197,7 +1270,9 @@ class Common(object):
                     host_map[site] = hostname
 
         self.HTTP_DNS = dns_servers
-        self.WITHGAE_SITES = set(withgae_sites)
+        self.WITHGAE_SITES = tuple(withgae_sites)
+        self.WITHPHP_SITES = tuple(withphp_sites)
+        self.WITHVPS_SITES = tuple(withvps_sites)
         self.CRLF_SITES = tuple(crlf_sites)
         self.NOCRLF_SITES = set(nocrlf_sites)
         self.FORCEHTTPS_SITES = tuple(forcehttps_sites)
@@ -1213,6 +1288,7 @@ class Common(object):
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|') if v else []) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOST_MAP.items() if k == v)
+        self.IPLIST_PREDEFINED = [x for x in sum(self.IPLIST_MAP.values(), []) if re.match(r'^\d+\.\d+\.\d+\.\d+$', x) or ':' in x]
 
         self.PAC_ENABLE = self.CONFIG.getint('pac', 'enable')
         self.PAC_IP = self.CONFIG.get('pac', 'ip')
@@ -1332,7 +1408,7 @@ class Common(object):
                 except Queue.Empty:
                     break
             if name == 'google_hk' and need_resolve_remote:
-                for delay in (1, 60, 150, 240, 300, 450, 600, 900):
+                for delay in (30, 60, 150, 240, 300, 450, 600, 900):
                     spawn_later(delay, self.extend_iplist, name, need_resolve_remote)
             if name.startswith('google_') and name not in ('google_cn', 'google_hk') and resolved_iplist:
                 iplist_prefix = re.split(r'[\.:]', resolved_iplist[0])[0]
@@ -1346,6 +1422,9 @@ class Common(object):
                 sys.exit(-1)
             logging.info('resolve name=%s host to iplist=%r', name, resolved_iplist)
             common.IPLIST_MAP[name] = resolved_iplist
+        if len(self.IPLIST_MAP.get('google_cn', [])) < 4 and self.IPLIST_MAP.get('google_hk', []):
+            logging.warning('google_cn resolved too short iplist=%s, switch to google_hk', self.IPLIST_MAP.get('google_cn', []))
+            self.IPLIST_MAP['google_cn'] = self.IPLIST_MAP['google_hk']
 
     def info(self):
         info = ''
@@ -1412,19 +1491,28 @@ def pre_start():
             m = re.search(r'(?im)(BogoMIPS|cpu MHz)\s+:\s+([\d\.]+)', fp.read())
             if m and float(m.group(2)) < 1000:
                 logging.warning("*NOTE*, if you want to fix high cpu usage, please decrease [gae]window")
+    if gevent.__version__ < '1.0':
+        logging.warning("*NOTE*, please upgrade to gevent 1.1 as possible")
     if GAEProxyHandler.max_window != common.GAE_WINDOW:
         GAEProxyHandler.max_window = common.GAE_WINDOW
-    if common.GAE_KEEPALIVE and common.GAE_MODE == 'https':
+    if common.GAE_CACHESOCK:
+        GAEProxyHandler.tcp_connection_cachesock = True
+        GAEProxyHandler.ssl_connection_cachesock = True
+    if common.GAE_KEEPALIVE:
+        GAEProxyHandler.tcp_connection_cachesock = True
+        GAEProxyHandler.tcp_connection_keepalive = True
+        GAEProxyHandler.ssl_connection_cachesock = True
         GAEProxyHandler.ssl_connection_keepalive = True
+    if common.IPLIST_PREDEFINED:
+        GAEProxyHandler.iplist_predefined = set(common.IPLIST_PREDEFINED)
     if common.GAE_PAGESPEED and not common.GAE_OBFUSCATE:
         logging.critical("*NOTE*, [gae]pagespeed=1 requires [gae]obfuscate=1")
         sys.exit(-1)
-    if common.GAE_SSLVERSION:
+    if common.GAE_SSLVERSION and not sysconfig.get_platform().startswith('macosx-'):
         GAEProxyHandler.ssl_version = getattr(ssl, 'PROTOCOL_%s' % common.GAE_SSLVERSION)
         GAEProxyHandler.openssl_context = SSLConnection.context_builder(common.GAE_SSLVERSION)
     if common.GAE_ENABLE and common.GAE_APPIDS[0] == 'goagent':
-        logging.critical('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
-        sys.exit(-1)
+        logging.warning('please edit %s to add your appid to [gae] !', common.CONFIG_FILENAME)
     if common.GAE_ENABLE and common.GAE_MODE == 'http' and common.GAE_PASSWORD == '':
         logging.critical('to enable http mode, you should set %r [gae]password = <your_pass> and [gae]options = rc4', common.CONFIG_FILENAME)
         sys.exit(-1)
@@ -1462,8 +1550,8 @@ def pre_start():
         GAEProxyHandler.handler_filters.insert(0, FakeHttpsFilter(common.FAKEHTTPS_SITES, common.NOFAKEHTTPS_SITES))
     if common.FORCEHTTPS_SITES:
         GAEProxyHandler.handler_filters.insert(0, ForceHttpsFilter(common.FORCEHTTPS_SITES, common.NOFORCEHTTPS_SITES))
-    if common.WITHGAE_SITES:
-        GAEProxyHandler.handler_filters.insert(0, JumpLastFilter(common.WITHGAE_SITES))
+    if common.WITHGAE_SITES or common.WITHPHP_SITES or common.WITHVPS_SITES:
+        GAEProxyHandler.handler_filters.insert(0, WithGAEFilter(common.WITHGAE_SITES, common.WITHPHP_SITES, common.WITHVPS_SITES))
     if common.USERAGENT_ENABLE:
         GAEProxyHandler.handler_filters.insert(0, UserAgentFilter(common.USERAGENT_STRING))
     if common.LISTEN_USERNAME:
@@ -1478,40 +1566,38 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     logging.basicConfig(level=logging.DEBUG if common.LISTEN_DEBUGINFO else logging.INFO, format='%(levelname)s - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
     pre_start()
-    if common.GAE_ENABLE:
-        CertUtil.check_ca()
     sys.stderr.write(common.info())
-    #uvent_enabled = 'uvent.loop' in sys.modules and isinstance(gevent.get_hub().loop, __import__('uvent').loop.UVLoop)
-    if common.PHP_ENABLE:
-        host, port = common.PHP_LISTEN.split(':')
-        HandlerClass = PHPProxyHandler if not common.PROXY_ENABLE else ProxyPHPProxyHandler
-        server = LocalProxyServer((host, int(port)), HandlerClass)
-        thread.start_new_thread(server.serve_forever, tuple())
 
     if common.PAC_ENABLE:
-        server = LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACProxyHandler)
-        thread.start_new_thread(server.serve_forever, tuple())
+        thread.start_new_thread(LocalProxyServer((common.PAC_IP, common.PAC_PORT), PACProxyHandler).serve_forever, tuple())
 
     if common.DNS_ENABLE:
         try:
-            sys.path += ['.']
             from dnsproxy import DNSServer
             host, port = common.DNS_LISTEN.split(':')
-            server = DNSServer((host, int(port)), dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST, dns_tcpover=common.DNS_TCPOVER)
-            thread.start_new_thread(server.serve_forever, tuple())
+            dns_server = DNSServer((host, int(port)), dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST, dns_tcpover=common.DNS_TCPOVER)
+            thread.start_new_thread(dns_server.serve_forever, tuple())
         except ImportError:
             logging.exception('GoAgent DNSServer requires dnslib and gevent 1.0')
             sys.exit(-1)
 
+    if common.GAE_ENABLE or common.PHP_ENABLE:
+        CertUtil.check_ca()
+
+    php_server = None
+    if common.PHP_ENABLE:
+        host, port = common.PHP_LISTEN.split(':')
+        HandlerClass = PHPProxyHandler if not common.PROXY_ENABLE else ProxyPHPProxyHandler
+        HandlerClass.handler_plugins['php'] = PHPFetchPlugin(common.PHP_FETCHSERVERS, common.PHP_PASSWORD, common.PHP_VALIDATE)
+        php_server = LocalProxyServer((host, int(port)), HandlerClass)
+        thread.start_new_thread(php_server.serve_forever, tuple())
+
     if common.GAE_ENABLE:
         HandlerClass = GAEProxyHandler if not common.PROXY_ENABLE else ProxyGAEProxyHandler
-        server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), HandlerClass)
-        try:
-            server.serve_forever()
-        except SystemError as e:
-            if '(libev) select: ' in repr(e):
-                logging.error('PLEASE START GOAGENT BY uvent.bat')
-                sys.exit(-1)
+        if common.PHP_ENABLE:
+            HandlerClass.handler_plugins['php'] = php_server.RequestHandlerClass.handler_plugins['php']
+        gae_server = LocalProxyServer((common.LISTEN_IP, common.LISTEN_PORT), HandlerClass)
+        gae_server.serve_forever()
     else:
         gevent.sleep(sys.maxint)
 
