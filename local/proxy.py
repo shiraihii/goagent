@@ -45,7 +45,7 @@
 #      Hubertzhang       <hubert.zyk@gmail.com>
 #      arrix             <arrixzhou@gmail.com>
 
-__version__ = '3.1.22'
+__version__ = '3.1.23'
 
 import os
 import sys
@@ -379,11 +379,11 @@ class RangeFetch(object):
 
 
 class GAEFetchPlugin(BaseFetchPlugin):
-    """direct fetch plugin"""
+    """gae fetch plugin"""
     connect_timeout = 4
     max_retry = 2
 
-    def __init__(self, appids, password, path, mode, cachesock, keepalive, obfuscate, pagespeed, validate, options):
+    def __init__(self, appids, password, path, mode, cachesock, keepalive, obfuscate, pagespeed, validate, options, maxsize):
         BaseFetchPlugin.__init__(self)
         self.appids = appids
         self.password = password
@@ -395,6 +395,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
         self.pagespeed = pagespeed
         self.validate = validate
         self.options = options
+        self.maxsize = maxsize
 
     def handle(self, handler, **kwargs):
         assert handler.command != 'CONNECT'
@@ -486,7 +487,8 @@ class GAEFetchPlugin(BaseFetchPlugin):
             kwargs['options'] = self.options
         if self.validate:
             kwargs['validate'] = self.validate
-        kwargs['fetchmaxsize'] = common.AUTORANGE_MAXSIZE
+        if self.maxsize:
+            kwargs['maxsize'] = self.maxsize
         metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
         skip_headers = handler.skip_headers
         metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
@@ -542,7 +544,7 @@ class GAEFetchPlugin(BaseFetchPlugin):
 
 
 class PHPFetchPlugin(BaseFetchPlugin):
-    """direct fetch plugin"""
+    """php fetch plugin"""
     connect_timeout = 4
     def __init__(self, fetchservers, password, validate):
         BaseFetchPlugin.__init__(self)
@@ -679,7 +681,9 @@ class HostsFilter(BaseProxyHandlerFilter):
 
 
 class GAEFetchFilter(BaseProxyHandlerFilter):
-    """force https filter"""
+    """gae fetch filter"""
+    #https://github.com/AppScale/gae_sdk/blob/master/google/appengine/api/taskqueue/taskqueue.py#L241
+    MAX_URL_LENGTH = 2083
     def filter(self, handler):
         """https://developers.google.com/appengine/docs/python/urlfetch/"""
         if handler.command == 'CONNECT':
@@ -691,12 +695,12 @@ class GAEFetchFilter(BaseProxyHandlerFilter):
             if 'php' in handler.handler_plugins:
                 return 'php', {}
             else:
-                logging.warning('"%s %s" not supported by GAE, please enable PHP mode!', handler.command, handler.host)
+                logging.warning('"%s %s" not supported by GAE, please enable PHP mode!', handler.command, handler.path)
                 return 'direct', {}
 
 
 class WithGAEFilter(BaseProxyHandlerFilter):
-    """force https filter"""
+    """withgae/withphp/withvps filter"""
     def __init__(self, withgae_sites, withphp_sites, withvps_sites):
         self.withgae_sites = set(x for x in withgae_sites if not x.startswith('.'))
         self.withgae_sites_postfix = tuple(x for x in withgae_sites if x.startswith('.'))
@@ -738,7 +742,7 @@ class GAEProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
         random.shuffle(common.GAE_APPIDS)
-        self.__class__.handler_plugins['gae'] = GAEFetchPlugin(common.GAE_APPIDS, common.GAE_PASSWORD, common.GAE_PATH, common.GAE_MODE, common.GAE_CACHESOCK, common.GAE_KEEPALIVE, common.GAE_OBFUSCATE, common.GAE_PAGESPEED, common.GAE_VALIDATE, common.GAE_OPTIONS)
+        self.__class__.handler_plugins['gae'] = GAEFetchPlugin(common.GAE_APPIDS, common.GAE_PASSWORD, common.GAE_PATH, common.GAE_MODE, common.GAE_CACHESOCK, common.GAE_KEEPALIVE, common.GAE_OBFUSCATE, common.GAE_PAGESPEED, common.GAE_VALIDATE, common.GAE_OPTIONS, common.GAE_MAXSIZE)
         try:
             self.__class__.hosts_filter = next(x for x in self.__class__.handler_filters if isinstance(x, HostsFilter))
         except StopIteration:
@@ -764,7 +768,7 @@ class ProxyGAEProxyHandler(ProxyConnectionMixin, GAEProxyHandler):
 
 
 class PHPFetchFilter(BaseProxyHandlerFilter):
-    """force https filter"""
+    """php fetch filter"""
     def filter(self, handler):
         if handler.command == 'CONNECT':
             return 'strip', {}
@@ -772,8 +776,14 @@ class PHPFetchFilter(BaseProxyHandlerFilter):
             return 'php', {}
 
 
+class VPSFetchFilter(BaseProxyHandlerFilter):
+    """vps fetch filter"""
+    def filter(self, handler):
+        return 'vps', {}
+
+
 class PHPProxyHandler(MultipleConnectionMixin, SimpleProxyHandler):
-    """GAE Proxy Handler"""
+    """PHP Proxy Handler"""
     handler_filters = [PHPFetchFilter()]
     handler_plugins = {'direct': DirectFetchPlugin(),
                        'mock': MockFetchPlugin(),
@@ -1203,6 +1213,7 @@ class Common(object):
         self.GAE_REGIONS = set(x.upper() for x in self.CONFIG.get('gae', 'regions').split('|') if x.strip())
         self.GAE_SSLVERSION = self.CONFIG.get('gae', 'sslversion')
         self.GAE_PAGESPEED = self.CONFIG.getint('gae', 'pagespeed') if self.CONFIG.has_option('gae', 'pagespeed') else 0
+        self.GAE_MAXSIZE = self.CONFIG.getint('gae', 'maxsize')
 
         if self.GAE_PROFILE == 'auto':
             try:
@@ -1363,10 +1374,14 @@ class Common(object):
                     logging.info('%s remote host=%r failed: %s', str(dnslib_resolve).split()[1], host, e)
                     time.sleep(1)
         result_queue = Queue.Queue()
+        pool = __import__('gevent.pool', fromlist=['.']).Pool(10) if sys.modules.get('gevent') else None
         for host in hosts:
             for dnsserver in self.DNS_SERVERS:
                 logging.debug('remote resolve host=%r from dnsserver=%r', host, dnsserver)
-                thread.start_new_thread(do_remote_resolve, (host, dnsserver, result_queue))
+                if pool:
+                    pool.spawn(do_remote_resolve, host, dnsserver, result_queue)
+                else:
+                    thread.start_new_thread(do_remote_resolve, (host, dnsserver, result_queue))
         for _ in xrange(len(self.DNS_SERVERS) * len(hosts) * 2):
             try:
                 host, dnsserver, iplist = result_queue.get(timeout=16)
@@ -1417,11 +1432,17 @@ class Common(object):
                 resolved_iplist = list(set(resolved_iplist))
             if name.startswith('google_'):
                 resolved_iplist = list(set(resolved_iplist) - set(google_blacklist))
-            if len(resolved_iplist) == 0 and name in ('google_hk', 'google_cn'):
+            if len(resolved_iplist) == 0 and name in ('google_hk', 'google_cn') and self.GAE_PROFILE != 'ipv6':
                 logging.error('resolve %s host return empty! please retry!', name)
                 sys.exit(-1)
             logging.info('resolve name=%s host to iplist=%r', name, resolved_iplist)
             common.IPLIST_MAP[name] = resolved_iplist
+        if self.IPLIST_MAP.get('google_cn', []):
+            try:
+                for _ in xrange(4):
+                    socket.create_connection((random.choice(self.IPLIST_MAP['google_cn']), 80), timeout=2).close()
+            except socket.error:
+                self.IPLIST_MAP['google_cn'] = []
         if len(self.IPLIST_MAP.get('google_cn', [])) < 4 and self.IPLIST_MAP.get('google_hk', []):
             logging.warning('google_cn resolved too short iplist=%s, switch to google_hk', self.IPLIST_MAP.get('google_cn', []))
             self.IPLIST_MAP['google_cn'] = self.IPLIST_MAP['google_hk']
@@ -1545,7 +1566,7 @@ def pre_start():
     if common.CRLF_SITES:
         GAEProxyHandler.handler_filters.insert(0, CRLFSitesFilter(common.CRLF_SITES, common.NOCRLF_SITES))
     if common.URLREWRITE_MAP:
-        GAEProxyHandler.handler_filters.insert(0, URLRewriteFilter(common.URLREWRITE_MAP))
+        GAEProxyHandler.handler_filters.insert(0, URLRewriteFilter(common.URLREWRITE_MAP, common.FORCEHTTPS_SITES, common.NOFORCEHTTPS_SITES))
     if common.FAKEHTTPS_SITES:
         GAEProxyHandler.handler_filters.insert(0, FakeHttpsFilter(common.FAKEHTTPS_SITES, common.NOFAKEHTTPS_SITES))
     if common.FORCEHTTPS_SITES:

@@ -1202,7 +1202,7 @@ class CRLFSitesFilter(BaseProxyHandlerFilter):
 
 class URLRewriteFilter(BaseProxyHandlerFilter):
     """url rewrite filter"""
-    def __init__(self, urlrewrite_map):
+    def __init__(self, urlrewrite_map, forcehttps_sites, noforcehttps_sites):
         self.urlrewrite_map = {}
         for regex, repl in urlrewrite_map.items():
             mo = re.search(r'://([^/:]+)', regex)
@@ -1214,6 +1214,8 @@ class URLRewriteFilter(BaseProxyHandlerFilter):
             if not mo:
                 logging.warning('URLRewriteFilter does not support wildcard host: %r', addr)
             self.urlrewrite_map.setdefault(addr, []).append((re.compile(regex).search, repl))
+        self.forcehttps_sites = tuple(forcehttps_sites)
+        self.noforcehttps_sites = set(noforcehttps_sites)
 
     def filter(self, handler):
         if handler.host not in self.urlrewrite_map:
@@ -1230,6 +1232,10 @@ class URLRewriteFilter(BaseProxyHandlerFilter):
     def filter_redirect(self, handler, mo, repl):
         for i, g in enumerate(mo.groups()):
             repl = repl.replace('$%d' % (i+1), urllib.unquote_plus(g))
+        if repl.startswith('http://') and self.forcehttps_sites:
+            hostname = urlparse.urlsplit(repl).hostname
+            if hostname.endswith(self.forcehttps_sites) and hostname not in self.noforcehttps_sites:
+                repl = 'https://%s' % repl[len('http://'):]
         headers = {'Location': repl, 'Connection': 'close'}
         return 'mock', {'status': 301, 'headers': headers, 'body': ''}
 
@@ -1631,9 +1637,11 @@ class MultipleConnectionMixin(object):
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
         #logging.info('gethostbyname2(%r) return %d addresses', hostname, len(addresses))
         sock = None
-        for i in range(kwargs.get('max_retry', 5)):
+        for i in range(kwargs.get('max_retry', 4)):
             reorg_ipaddrs()
             window = self.max_window + i
+            if len(self.tcp_connection_bad_ipaddrs)/2 >= len(self.tcp_connection_good_ipaddrs) <= 1.5 * window:
+                window += 2
             good_ipaddrs = [x for x in addresses if x in self.tcp_connection_good_ipaddrs]
             good_ipaddrs = sorted(good_ipaddrs, key=self.tcp_connection_time.get)[:window]
             unknown_ipaddrs = [x for x in addresses if x not in self.tcp_connection_good_ipaddrs and x not in self.tcp_connection_bad_ipaddrs]
@@ -1776,7 +1784,7 @@ class MultipleConnectionMixin(object):
                 if ipaddr not in self.ssl_connection_good_ipaddrs:
                     self.ssl_connection_good_ipaddrs[ipaddr] = handshaked_time
                 # verify SSL certificate.
-                if validate and hostname.endswith('.appspot.com'):
+                if validate and (hostname.endswith('.appspot.com') or '.google' in hostname):
                     cert = ssl_sock.get_peer_certificate()
                     commonname = next((v for k, v in cert.get_subject().get_components() if k == 'CN'))
                     if '.google' not in commonname and not commonname.endswith('.appspot.com'):
@@ -1839,9 +1847,11 @@ class MultipleConnectionMixin(object):
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
         #logging.info('gethostbyname2(%r) return %d addresses', hostname, len(addresses))
         sock = None
-        for i in range(kwargs.get('max_retry', 5)):
+        for i in range(kwargs.get('max_retry', 4)):
             reorg_ipaddrs()
             window = self.max_window + i
+            if len(self.ssl_connection_bad_ipaddrs)/2 >= len(self.ssl_connection_good_ipaddrs) <= 1.5 * window:
+                window += 2
             good_ipaddrs = [x for x in addresses if x in self.ssl_connection_good_ipaddrs]
             good_ipaddrs = sorted(good_ipaddrs, key=self.ssl_connection_time.get)[:window]
             unknown_ipaddrs = [x for x in addresses if x not in self.ssl_connection_good_ipaddrs and x not in self.ssl_connection_bad_ipaddrs]
